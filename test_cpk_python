@@ -1,0 +1,1112 @@
+
+from PyQt5.QtWidgets import QApplication, QWidget, QCheckBox, QTextEdit, QPushButton
+
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+import numpy as np
+import pandas as pd
+import matplotlib
+import sys
+import os
+import csv
+import time
+import logging
+from scipy.stats import gaussian_kde
+from PyQt5.QtCore import pyqtSignal
+matplotlib.use('Agg')
+matplotlib.use('Agg')  # Set non-interactive backend
+
+# Set global font settings
+plt.rcParams.update({
+    'font.family': 'sans-serif',
+    'font.size': 8,
+    'axes.titlesize': 10,
+    'axes.labelsize': 9,
+    'figure.titlesize': 12
+})
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    filename='cpk_analysis.log'
+)
+
+# Constants
+usl_strings = [
+    'Upper Limit ----->', 'Upper Limit----->', 'UpLimit ---->', 'Upper Limited----------->',
+    'UPPER LIMIT----->']
+lsl_strings = ['Lower Limit ----->', 'Lower Limit----->', 'LowLimit ---->', 'Lower Limited----------->',
+               'LOWER LIMIT----->']
+sn_strings = ["SerialNumber", "SERIALNUMBER"]
+sn_prefix_strs = "H0"
+cp_strings = ['Check Point', 'Check Points', 'check point', 'check points', 'cp', 'CP', 'Cp']
+cfg_strings = "Config"
+t_zero_strs = ["T0"]
+plot_t0 = False
+plot_drift = True
+drift_sigma = 4
+if_plot_by_loc = True
+ignore_sn = True
+drop_dup = "last"
+pass_only = True
+check_drift = False
+if_plot_all = False
+peak_var_usl = 15
+#plot_by_loc_paras = [
+#   "REL_FS", "REL_OpenImage", "REL_BL_RMS_noise", "REL_BL_Coex_RMS_noise"]
+#rel_fatp_map_dict = {
+#    plot_by_loc_paras[0]: "PC_FS",
+#    plot_by_loc_paras[1]: "PC_OpenImage",
+#   plot_by_loc_paras[2]: "PC_BL_RMS_noise",
+#   plot_by_loc_paras[3]: "PC_BL_Coex_RMS_noise"
+#}
+OutputFolderName = "CPK_ana_outputs"
+pdf_name = "CPK_Ana.pdf"
+SaveFigures = 0
+cpk_waived_strings = ["can list here", "can llist here"]
+usl_only_strings = [""]
+lsl_only_strings = [""]
+
+# Color palette for multiple files
+COLOR_PALETTE = [
+    '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+    '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf'
+]
+
+
+def load_config(file_name):
+    """load configuration from config file"""
+    if not os.path.exists(file_name):
+        return
+    config_strs = []
+    with open(file_name, "r") as f:
+        for line in f.readlines():
+            line_str = line.strip()
+            line_str_nosp = "".join((i.strip(" ") for i in line_str))
+            config_strs.append(line_str_nosp.split(","))
+
+    for config_str in config_strs:
+        config_name = config_str[0]
+        if config_name in globals():
+            if len(config_str[1]) < 1:
+                continue
+            globals()[config_name] = config_str[1]
+            print("Load " + config_name + " as : ", globals()[config_name])
+
+
+def csv_to_list(filename):
+    """read csv to list with robust encoding handling"""
+    encodings = ['utf-8', 'latin-1', 'iso-8859-1', 'cp1252']
+    for encoding in encodings:
+        try:
+            with open(filename, newline="", encoding=encoding) as csvfile:
+                reader = csv.reader(csvfile, delimiter=",", quotechar='"')
+                return list(reader)
+        except UnicodeDecodeError:
+            continue
+
+    # Fallback with error handling
+    try:
+        with open(filename, newline="", encoding='utf-8', errors='replace') as csvfile:
+            reader = csv.reader(csvfile, delimiter=",", quotechar='"')
+            return list(reader)
+    except Exception as e:
+        print(f"Failed to read file {filename} with error: {e}")
+        return []
+
+
+def csv_to_df(filename):
+    """read csv to dataframe with robust parsing"""
+    try:
+        return pd.read_csv(filename, encoding='utf-8', engine='python', on_bad_lines='warn')
+    except Exception as e:
+        print(f"Error reading {filename}: {e}")
+        return pd.DataFrame()
+
+
+def find_known_words(search_words, known_words):
+    """Find known words in a 2D list (like CSV data)"""
+    for know_word in known_words:
+        for row in range(len(search_words)):
+            for col in range(len(search_words[row])):
+                if search_words[row][col] == know_word:
+                    return know_word, [row, col]
+
+    print("Error: could not find any of these words in the CSV:")
+    for know_word in known_words:
+        print(f'"{know_word}"')
+    return None, None
+
+
+def pd_str_to_num_with_nan(data_df, start_col=None):
+    """Replace all non-numeric values with NaN"""
+    if start_col is None:
+        start_col = 0
+
+    cols = slice(start_col, data_df.shape[1])
+    data_df.iloc[:, cols] = data_df.iloc[:, cols].apply(pd.to_numeric, errors="coerce", axis=1)
+    return data_df.infer_objects()
+
+
+def is_number(s):
+    """check if is number"""
+    try:
+        float(s)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def get_limits(data_head, limits_row, index_col, usl_string, lsl_string):
+    """get limits from data head with error handling"""
+    try:
+        data_head_df = pd.DataFrame(data_head)
+        data_head_df.columns = data_head_df.iloc[limits_row].tolist()
+        data_head_df.set_index(data_head_df.iloc[limits_row, index_col], drop=False, inplace=True)
+        return data_head_df.loc[[lsl_string, usl_string]]
+    except Exception as e:
+        print(f"Error getting limits: {e}")
+        return pd.DataFrame()
+
+
+def get_valid_data(log_data, valid_col1, valid_col2, min_starting_row, column_name_row):
+    """get valid data by multiple columns with robust validation"""
+    start_row = None
+    for row in range(min_starting_row, len(log_data)):
+        if (len(log_data[row][valid_col1].strip()) != 0 and
+                len(log_data[row][valid_col2]) != 0 and
+                is_number(log_data[row][valid_col2])):
+            start_row = row
+            break
+
+    if start_row is None:
+        print("Error, could not find start row.")
+        return None
+
+    try:
+        unit_data_df = pd.DataFrame(log_data[start_row:])
+        unit_data_df.columns = log_data[column_name_row]
+        unit_data_df.set_index(log_data[column_name_row][valid_col1], drop=False, inplace=True)
+        return pd_str_to_num_with_nan(unit_data_df, valid_col2)
+    except Exception as e:
+        print(f"Error creating valid data DataFrame: {e}")
+        return None
+
+
+def find_strings_in_list(data_list, searching_strs):
+    """find specific strings in list"""
+    metrics_with_strs = []
+    metrics_without_strs = []
+    for elem in data_list:
+        if any(string in elem for string in searching_strs):
+            metrics_with_strs.append(elem)
+        else:
+            metrics_without_strs.append(elem)
+    return metrics_with_strs, metrics_without_strs
+
+
+def remove_thousand_sep(data_list, chars=None):
+    """remove thousand separators from data"""
+    if chars is None:
+        chars = [","]  # Default to comma if no chars provided
+
+    for row in range(len(data_list)):
+        for col in range(len(data_list[row])):
+            if isinstance(data_list[row][col], str):
+                for char in chars:
+                    data_list[row][col] = data_list[row][col].replace(char, "")
+    return data_list
+
+
+def get_smt_data_from_csv(csv_name, sn_strings, usl_strings, lsl_strings, drop_dup='last', pass_only=True, label='log'):
+    """get data from csv with proper error handling"""
+    try:
+        # Read and clean CSV data
+        csv_raw_data = csv_to_list(csv_name)
+        if not csv_raw_data:
+            raise ValueError("Empty or invalid CSV file")
+
+        log_raw_data = remove_thousand_sep(csv_raw_data, [","])
+
+        # Find required headers
+        sn_string, index_sn = find_known_words(log_raw_data, sn_strings)
+        usl_string, index_usl = find_known_words(log_raw_data, usl_strings)
+        lsl_string, index_lsl = find_known_words(log_raw_data, lsl_strings)
+
+        if None in [index_sn, index_usl, index_lsl]:
+            raise ValueError("Could not find required headers in CSV")
+
+        limits_df = get_limits(log_raw_data, index_sn[0], index_usl[1], usl_string, lsl_string)
+        if limits_df.empty:
+            raise ValueError("Could not extract limits from data")
+
+        # Handle duplicated columns
+        if limits_df.columns.duplicated().any():
+            print("Found duplicated columns in data")
+            limits_df = limits_df.loc[:, ~limits_df.columns.duplicated()].copy()
+
+        metrics_with_limits = filter_metrics_with_limits(limits_df)
+        if not metrics_with_limits:
+            raise ValueError("No metrics with valid limits found")
+
+        first_metric = metrics_with_limits[0]
+        _, index_first_metric = find_known_words(log_raw_data, [first_metric])
+        if index_first_metric is None:
+            raise ValueError(f"Could not locate column for first metric: {first_metric}")
+
+        # Convert to numeric
+        limits_nan_df = pd_str_to_num_with_nan(limits_df, index_first_metric[1])
+
+        # Get valid data
+        log_data_df = get_valid_data(
+            log_raw_data,
+            index_sn[1],
+            index_first_metric[1],
+            max(index_usl[0], index_lsl[0]) + 1,
+            index_sn[0]
+        )
+
+        if log_data_df is None:
+            raise ValueError("No valid data rows found")
+
+        # Handle duplicates
+        if log_data_df.columns.duplicated().any():
+            print("Found duplicated columns in log data")
+            log_data_df = log_data_df.loc[:, ~log_data_df.columns.duplicated()].copy()
+
+        # Handle row duplicates
+        if drop_dup in ["first", "last"]:
+            log_data_df_dropdup = log_data_df.drop_duplicates(subset=sn_string, keep=drop_dup)
+        else:
+            log_data_df_dropdup = log_data_df.copy(deep=True)
+
+        # Filter pass-only data if requested
+        if pass_only:
+            log_data_passonly_df = log_data_df_dropdup.copy(deep=True)
+            numeric_metrics = metrics_with_limits
+
+            # Convert to float for comparison
+            data_values = log_data_df_dropdup[numeric_metrics].astype(float)
+            usl_values = limits_df.loc[usl_string, numeric_metrics].astype(float)
+            lsl_values = limits_df.loc[lsl_string, numeric_metrics].astype(float)
+
+            # Apply pass/fail filters
+            usl_fail = data_values > usl_values
+            lsl_fail = data_values < lsl_values
+            log_data_passonly_df[numeric_metrics] = data_values.mask(usl_fail | lsl_fail)
+        else:
+            log_data_passonly_df = log_data_df_dropdup
+
+        # Add label columns
+        limits_nan_df = pd.concat([pd.Series([label] * len(limits_nan_df), name="Label"), limits_nan_df], axis=1)
+        log_data_passonly_df = pd.concat(
+            [pd.Series([label] * len(log_data_passonly_df), name="Label"), log_data_passonly_df], axis=1)
+
+        return log_data_passonly_df, limits_nan_df, metrics_with_limits, sn_string, usl_string, lsl_string
+    except Exception as e:
+        print(f"Error processing {csv_name}: {str(e)}")
+        raise
+
+
+def calc_cpk(data_df: pd.DataFrame,
+             limits_df: pd.DataFrame,
+             metrics_with_limits: list[str],
+             usl_only_strings: list[str],
+             lsl_only_strings: list[str],
+             waived_strings: list[str],
+             usl_string: str,
+             lsl_string: str,
+             if_sort: bool = True,
+             sort_column: str = 'cpk',
+             sort_axis: int = 0,
+             label: str = 'log') -> tuple[pd.DataFrame, pd.DataFrame, list[str], list[str]]:
+    """
+    Calculate CPK statistics with proper error handling
+    """
+    try:
+        # Initialize DataFrame with proper typing
+        stat_metrics_df = pd.DataFrame(index=metrics_with_limits)
+        stat_metrics_df["Label"] = label
+
+        # Safely get limits with explicit type conversion
+        usl_values = limits_df.loc[usl_string, metrics_with_limits]
+        lsl_values = limits_df.loc[lsl_string, metrics_with_limits]
+        stat_metrics_df["usl"] = pd.to_numeric(usl_values, errors='coerce')
+        stat_metrics_df["lsl"] = pd.to_numeric(lsl_values, errors='coerce')
+
+        # Skip parameters where USL == LSL with proper type handling
+        comparison_result = stat_metrics_df["usl"] == stat_metrics_df["lsl"]
+        if isinstance(comparison_result, pd.Series):
+            same_limits_mask = comparison_result
+        else:
+            # Handle case where comparison returns a scalar
+            same_limits_mask = pd.Series([bool(comparison_result)] * len(metrics_with_limits),
+                                         index=metrics_with_limits)
+
+        metrics_with_limits = [m for m in metrics_with_limits
+                               if not same_limits_mask.get(m, False)]
+
+        if not metrics_with_limits:
+            print("No parameters with different USL/LSL values found")
+            return pd.DataFrame(), pd.DataFrame(), [], []
+
+        # Reinitialize DataFrame with filtered metrics
+        stat_metrics_df = pd.DataFrame(index=metrics_with_limits)
+        stat_metrics_df["Label"] = label
+        stat_metrics_df["usl"] = limits_df.loc[usl_string, metrics_with_limits].astype(float)
+        stat_metrics_df["lsl"] = limits_df.loc[lsl_string, metrics_with_limits].astype(float)
+
+        # Calculate basic statistics
+        stat_metrics_df["mean"] = data_df[metrics_with_limits].mean(axis=0)
+        stat_metrics_df["min"] = data_df[metrics_with_limits].min(axis=0)
+        stat_metrics_df["max"] = data_df[metrics_with_limits].max(axis=0)
+        stat_metrics_df["std"] = data_df[metrics_with_limits].std(axis=0)
+
+        # Skip parameters where max == min (no variation) with proper type handling
+        max_min_comparison = stat_metrics_df["max"] == stat_metrics_df["min"]
+        if isinstance(max_min_comparison, pd.Series):
+            no_variation_mask = max_min_comparison
+        else:
+            no_variation_mask = pd.Series([bool(max_min_comparison)] * len(metrics_with_limits),
+                                          index=metrics_with_limits)
+
+        metrics_with_variation = [m for m in metrics_with_limits
+                                  if not no_variation_mask.get(m, False)]
+        metrics_with_limits = metrics_with_variation
+
+        if not metrics_with_limits:
+            print("No parameters with variation found")
+            return pd.DataFrame(), pd.DataFrame(), [], []
+
+        # Reinitialize DataFrame again with metrics that have variation
+        stat_metrics_df = stat_metrics_df.loc[metrics_with_limits]
+
+        # Calculate CPU and CPL with division by zero protection
+        with np.errstate(divide='ignore', invalid='ignore'):
+            cpu_values = (stat_metrics_df["usl"] - stat_metrics_df["mean"]) / (3.0 * stat_metrics_df["std"])
+            cpl_values = (stat_metrics_df["mean"] - stat_metrics_df["lsl"]) / (3.0 * stat_metrics_df["std"])
+            stat_metrics_df["cpu"] = cpu_values.astype(float)
+            stat_metrics_df["cpl"] = cpl_values.astype(float)
+
+        # Handle special cases with explicit type checking
+        if usl_only_strings and len(usl_only_strings[0].strip()) > 1:
+            metrics_usl_only, _ = find_strings_in_list(metrics_with_limits, usl_only_strings)
+            stat_metrics_df.loc[metrics_usl_only, "cpl"] = np.nan
+
+        if lsl_only_strings and len(lsl_only_strings[0].strip()) > 1:
+            metrics_lsl_only, _ = find_strings_in_list(metrics_with_limits, lsl_only_strings)
+            stat_metrics_df.loc[metrics_lsl_only, "cpu"] = np.nan
+
+        # Calculate CPK with explicit typing
+        cpk_values = stat_metrics_df[["cpu", "cpl"]].min(axis=1)
+        stat_metrics_df["cpk"] = cpk_values.astype(float)
+        stat_metrics_df["N"] = data_df[metrics_with_limits].count(axis=0).astype(int)
+
+        # Handle waived metrics with explicit type checking
+        metrics_without_cpk: list[str]
+        metrics_with_cpk: list[str]
+        metrics_without_cpk, metrics_with_cpk = find_strings_in_list(metrics_with_limits, waived_strings)
+
+        # Sort results if requested
+        stat_metrics_bycpk_df: pd.DataFrame
+        stat_waived_bycpk_df: pd.DataFrame
+
+        if if_sort:
+            stat_metrics_bycpk_df = stat_metrics_df.loc[metrics_with_cpk].sort_values(
+                by=sort_column, axis=sort_axis)
+            stat_waived_bycpk_df = stat_metrics_df.loc[metrics_without_cpk].sort_values(
+                by=sort_column, axis=sort_axis)
+        else:
+            stat_metrics_bycpk_df = stat_metrics_df.loc[metrics_with_cpk]
+            stat_waived_bycpk_df = stat_metrics_df.loc[metrics_without_cpk]
+
+        return (stat_metrics_bycpk_df, stat_waived_bycpk_df,
+                metrics_with_cpk, metrics_without_cpk)
+
+
+    except Exception as e:
+
+        print(f"Error calculating CPK: {e}")
+
+        raise
+
+
+# In the imports section, add scipy for KDE
+def plot_to_pdf(output_path, all_log_data, all_limits_data, all_stat_data, file_name, labels, if_plot_all):
+    """Generate PDF report with dynamic-width summary tables, always sorted by last file's CPK"""
+    global pdf_path
+    try:
+        # Create output directory if it doesn't exist
+        os.makedirs(output_path, exist_ok=True)
+
+        # Update filename to reflect filter status
+        filter_status = f"_Pass{int(pass_only)}_Last{int(drop_dup == 'last')}"
+        pdf_path = os.path.join(output_path, file_name.replace('.pdf', f'{filter_status}.pdf'))
+
+        # Check for metrics with low variance (skip KDE for these)
+        print("\nChecking for metrics with low variance...")
+        problematic_metrics = []
+        for metric in set().union(*[set(df.index) for df in all_stat_data.values()]):
+            for label in labels:
+                if metric in all_log_data[label].columns:
+                    data = all_log_data[label][metric].dropna()
+                    if len(data) > 1 and np.ptp(data) <= 1e-8:
+                        problematic_metrics.append(metric)
+                        break
+
+        if problematic_metrics:
+            print("These metrics have low variance (KDE will be skipped):")
+            for metric in problematic_metrics:
+                print(f"- {metric}")
+        else:
+            print("No low-variance metrics detected")
+
+        with PdfPages(pdf_path) as pdf:
+            print(f"\nGenerating PDF report at: {pdf_path} [Pass Only: {pass_only}, Last Only: {drop_dup}]")
+
+            # ==================================================================
+            # 1. GET COMMON METRICS AND SORT BY LAST FILE'S CPK
+            # ==================================================================
+            # Get all metrics that appear in any file
+            all_metrics = set()
+            for label in labels:
+                all_metrics.update(all_stat_data[label].index)
+
+            # Create list of (metric, last_file_cpk) tuples for sorting
+            metric_cpk_pairs = []
+            for metric in all_metrics:
+                # Try to get CPK from last file first
+                if metric in all_stat_data[labels[-1]].index:
+                    cpk = all_stat_data[labels[-1]].loc[metric, 'cpk']
+                else:
+                    # Fall back to first available CPK if not in last file
+                    cpk = None
+                    for label in labels:
+                        if metric in all_stat_data[label].index:
+                            cpk = all_stat_data[label].loc[metric, 'cpk']
+                            break
+
+                # Handle NaN values by putting them last
+                sort_value = cpk if not pd.isna(cpk) else float('inf')
+                metric_cpk_pairs.append((metric, sort_value))
+
+            # Sort by CPK (ascending) - worst CPK first, NaN values last
+            sorted_metrics = [m[0] for m in sorted(metric_cpk_pairs, key=lambda x: x[1])]
+
+            # Filter metrics if not in plot-all mode
+            if not if_plot_all:
+                sorted_metrics = [m for m in sorted_metrics
+                                  if any(all_stat_data[label].loc[m, 'cpk'] <= 1.67
+                                         for label in labels if m in all_stat_data[label].index)]
+
+            # ==================================================================
+            # 2. MULTI-FILE COMPARISON TABLE (FOR 2+ FILES)
+            # ==================================================================
+            if len(labels) >= 2:
+                # Find parameters common to ALL files with matching USL/LSL
+                common_params = set(all_stat_data[labels[0]].index)
+                for label in labels[1:]:
+                    common_params.intersection_update(all_stat_data[label].index)
+
+                # Filter to only include sorted metrics
+                common_sorted_metrics = [m for m in sorted_metrics if m in common_params]
+
+                # Generate comparison data
+                comparison_data = []
+                for metric in common_sorted_metrics:
+                    # Verify USL/LSL match across all files
+                    base_usl = all_stat_data[labels[0]].loc[metric, 'usl']
+                    base_lsl = all_stat_data[labels[0]].loc[metric, 'lsl']
+
+                    usl_match = all(all_stat_data[label].loc[metric, 'usl'] == base_usl for label in labels)
+                    lsl_match = all(all_stat_data[label].loc[metric, 'lsl'] == base_lsl for label in labels)
+
+                    if usl_match and lsl_match:
+                        # Get N from last file
+                        n = all_stat_data[labels[-1]].loc[metric, 'N']
+
+                        # Build row with numbered columns
+                        row = [metric, f"{base_usl:.2f}", f"{base_lsl:.2f}"]
+
+                        # Add all means (mean, mean1, mean2...)
+                        for label in labels:
+                            row.append(f"{all_stat_data[label].loc[metric, 'mean']:.2f}")
+
+                        # Add all mins (min, min1, min2...)
+                        for label in labels:
+                            row.append(f"{all_stat_data[label].loc[metric, 'min']:.2f}")
+
+                        # Add all maxes (max, max1, max2...)
+                        for label in labels:
+                            row.append(f"{all_stat_data[label].loc[metric, 'max']:.2f}")
+
+                        # Add all stds (std, std1, std2...)
+                        for label in labels:
+                            row.append(f"{all_stat_data[label].loc[metric, 'std']:.2f}")
+
+                        # Add all CPUs (cpu, cpu1, cpu2...)
+                        for label in labels:
+                            row.append(f"{all_stat_data[label].loc[metric, 'cpu']:.2f}")
+
+                        # Add all CPLs (cpl, cpl1, cpl2...)
+                        for label in labels:
+                            row.append(f"{all_stat_data[label].loc[metric, 'cpl']:.2f}")
+
+                        # Add all CPKs (cpk, cpk1, cpk2...)
+                        for label in labels:
+                            row.append(f"{all_stat_data[label].loc[metric, 'cpk']:.2f}")
+
+                        row.append(str(n))
+                        comparison_data.append(row)
+
+                if comparison_data:
+                    # Generate column headers with numbered format
+                    col_labels = (
+                            ["Parameter", "USL", "LSL"] +
+                            ["Mean"] + [f"Mean{i}" for i in range(1, len(labels))] +
+                            ["Min"] + [f"Min{i}" for i in range(1, len(labels))] +
+                            ["Max"] + [f"Max{i}" for i in range(1, len(labels))] +
+                            ["Std"] + [f"Std{i}" for i in range(1, len(labels))] +
+                            ["CPU"] + [f"CPU{i}" for i in range(1, len(labels))] +
+                            ["CPL"] + [f"CPL{i}" for i in range(1, len(labels))] +
+                            ["CPK"] + [f"CPK{i}" for i in range(1, len(labels))] +
+                            ["N"]
+                    )
+
+                    # Split into chunks for pagination
+                    chunks = [comparison_data[i:i + 20] for i in range(0, len(comparison_data), 20)]
+
+                    for page_num, chunk in enumerate(chunks, 1):
+                        fig = plt.figure(figsize=(16, 9), dpi=100)
+                        ax = fig.add_subplot(111)
+                        ax.axis('off')
+
+                        # Create table with numbered columns
+                        table = ax.table(
+                            cellText=chunk,
+                            colLabels=col_labels,
+                            cellLoc='center',
+                            loc='center',
+                            colWidths=[0.45] + [0.04] * 2 + [0.05] * (len(col_labels) - 3)
+                        )
+
+                        # Style table with CPK highlighting
+                        table.auto_set_font_size(False)
+                        table.set_fontsize(8)
+                        for (i, j), cell in table.get_celld().items():
+                            cell.set_edgecolor('black')
+                            cell.set_linewidth(0.5)
+                            if i == 0:  # Header row
+                                cell.set_facecolor('#f0f0f0')
+                                cell.set_text_props(weight='bold', color='black')
+
+                            # Highlight low CPK values in red (CPK < 1.50)
+                            if j >= len(col_labels) - len(labels) - 1 and j < len(col_labels) - 1:  # CPK columns
+                                try:
+                                    cpk_value = float(cell.get_text().get_text())
+                                    if cpk_value < 1.50:
+                                        cell.set_facecolor('#ffcccc')  # Light red
+                                        cell.set_text_props(weight='bold', color='red')
+                                except (ValueError, AttributeError):
+                                    pass
+
+                            cell.set_height(0.05)
+
+                        plt.title(
+                            f"Parameter Comparison: {' vs '.join(labels)}\n(Sorted by {labels[-1]} CPK)\nPage {page_num} of {len(chunks)}",
+                            fontsize=12, pad=20)
+                        plt.subplots_adjust(left=0.05, right=0.95, top=0.9, bottom=0.05)
+                        pdf.savefig(fig, bbox_inches='tight')
+                        plt.close(fig)
+
+            # ==================================================================
+            # 3. SUMMARY TABLE (ALL CASES)
+            # ==================================================================
+            # Prepare summary data - group by metric (not by file)
+            summary_data = []
+            for metric in sorted_metrics:
+                for label in labels:
+                    if metric in all_stat_data[label].index:
+                        stat_df = all_stat_data[label]
+                        row = [label, metric] + [
+                            f"{stat_df.loc[metric, col]:.2f}"
+                            if isinstance(stat_df.loc[metric, col], (int, float))
+                            else str(stat_df.loc[metric, col])
+                            for col in ['usl', 'lsl', 'mean', 'min', 'max', 'std', 'cpu', 'cpl', 'cpk', 'N']
+                        ]
+                        summary_data.append(row)
+                    else:
+                        row = [label, metric] + ["N/A"] * 10
+                        summary_data.append(row)
+
+            # Split into chunks of max 20 metrics per page
+            chunks = [summary_data[i:i + 20] for i in range(0, len(summary_data), 20)]
+
+            for page_num, data_chunk in enumerate(chunks, 1):
+                fig = plt.figure(figsize=(16, 9), dpi=100)
+                ax = fig.add_subplot(111)
+                ax.axis('off')
+
+                # Calculate dynamic width for Parameter column
+                page_params = [row[1] for row in data_chunk]
+                max_param_len = max(len(str(param)) for param in page_params) if page_params else 20
+                param_width = min(0.1 + max_param_len * 0.01, 0.35)
+
+                # Create table with adjusted column widths
+                table = ax.table(
+                    cellText=data_chunk,
+                    colLabels=["Label", "Parameter", "USL", "LSL", "Mean", "Min", "Max",
+                               "Std", "CPU", "CPL", "CPK", "N"],
+                    cellLoc='center',
+                    loc='center',
+                    colWidths=[
+                        0.08,  # Label
+                        param_width,  # Parameter (dynamic)
+                        0.07, 0.07,  # USL/LSL
+                        0.08,  # Mean
+                        0.07, 0.07,  # Min/Max
+                        0.07,  # Std
+                        0.07, 0.07,  # CPU/CPL
+                        0.07,  # CPK
+                        0.05  # N
+                    ]
+                )
+
+                # Style table with CPK highlighting
+                table.auto_set_font_size(False)
+                table.set_fontsize(8)
+                for (i, j), cell in table.get_celld().items():
+                    cell.set_edgecolor('black')
+                    cell.set_linewidth(0.5)
+                    if i == 0:  # Header row
+                        cell.set_facecolor('#dddddd')
+                        cell.set_text_props(weight='bold')
+
+                    # Highlight low CPK values in red (CPK < 1.50)
+                    if j == 10 and i > 0:  # CPK column (0-based index 10), skip header row
+                        try:
+                            cpk_value = float(cell.get_text().get_text())
+                            if cpk_value < 1.50:
+                                cell.set_facecolor('#ffcccc')  # Light red
+                                cell.set_text_props(weight='bold', color='red')
+                        except (ValueError, AttributeError):
+                            pass
+
+                    cell.set_height(0.05)
+
+                # Dynamic title
+                title_parts = ["Test Parameters Summary (Sorted by Last File CPK)"]
+                if if_plot_all:
+                    title_parts.append("All Parameters")
+                else:
+                    title_parts.append("CPK ≤ 1.67")
+                title_parts.append(f"Page {page_num} of {len(chunks)}")
+
+                plt.title("\n".join(title_parts), y=1.02, fontsize=12)
+                plt.subplots_adjust(left=0.05, right=0.95, top=0.9, bottom=0.05)
+                pdf.savefig(fig, bbox_inches='tight')
+                plt.close(fig)
+
+            # ==================================================================
+            # 4. INDIVIDUAL METRIC PLOTS
+            # ==================================================================
+            for metric in sorted_metrics:
+                try:
+                    # Skip if we shouldn't plot all and metric is passing in all files
+                    if not if_plot_all:
+                        all_passing = True
+                        for label in labels:
+                            if metric in all_stat_data[label].index:
+                                if all_stat_data[label].loc[metric, 'cpk'] <= 1.67:
+                                    all_passing = False
+                                    break
+                        if all_passing:
+                            continue
+
+                    # Create figure with grid layout
+                    fig = plt.figure(figsize=(16, 9), dpi=100)
+                    gs = fig.add_gridspec(2, 2, height_ratios=[3, 1],
+                                          hspace=0.4, wspace=0.3,
+                                          left=0.08, right=0.95,
+                                          top=0.92, bottom=0.15)
+
+                    # Create subplots
+                    ax_box = fig.add_subplot(gs[0, 0])  # Boxplot
+                    ax_hist = fig.add_subplot(gs[0, 1])  # Histogram with KDE
+                    ax_table = fig.add_subplot(gs[1, :])  # Table
+
+                    fig.suptitle(
+                        f"{metric}\n(Sorted by {labels[-1]} CPK: {all_stat_data[labels[-1]].loc[metric, 'cpk']:.2f})",
+                        fontsize=14, y=0.98)
+
+                    # --- BOXPLOT ---
+                    box_data = []
+                    box_labels = []
+                    file_usl_lsl = {}  # Store USL/LSL per file
+
+                    for i, label in enumerate(labels):
+                        if metric in all_log_data[label].columns:
+                            metric_data = all_log_data[label][metric].dropna()
+                            if len(metric_data) > 0:
+                                box_data.append(metric_data)
+                                box_labels.append(label)
+
+                                # Store USL/LSL for this file
+                                if metric in all_stat_data[label].index:
+                                    file_usl_lsl[label] = {
+                                        'usl': all_stat_data[label].loc[metric, 'usl'],
+                                        'lsl': all_stat_data[label].loc[metric, 'lsl']
+                                    }
+
+                    if box_data:
+                        boxplot = ax_box.boxplot(box_data, patch_artist=True)
+                        ax_box.set_xticklabels(box_labels)
+
+                        # Set colors for boxes
+                        for i, box in enumerate(boxplot['boxes']):
+                            box.set_facecolor(COLOR_PALETTE[i % len(COLOR_PALETTE)])
+
+                        # Add USL/LSL lines for each file
+                        for i, label in enumerate(file_usl_lsl.keys(), 1):
+                            color = COLOR_PALETTE[(i - 1) % len(COLOR_PALETTE)]
+                            usl = file_usl_lsl[label]['usl']
+                            lsl = file_usl_lsl[label]['lsl']
+
+                            ax_box.axhline(usl, color=color, linestyle='--', linewidth=1,
+                                           alpha=0.7, label=f'{label} USL')
+                            ax_box.axhline(lsl, color=color, linestyle=':', linewidth=1,
+                                           alpha=0.7, label=f'{label} LSL')
+
+                        ax_box.set_ylabel("Value")
+                        ax_box.set_title("Boxplot Comparison", pad=10)
+                        ax_box.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+                        ax_box.grid(True, linestyle='--', alpha=0.3)
+
+                    # --- HISTOGRAM with KDE ---
+                    for i, label in enumerate(labels):
+                        if metric in all_log_data[label].columns:
+                            metric_data = all_log_data[label][metric].dropna()
+                            if len(metric_data) > 1:
+                                # Plot histogram
+                                n_bins = min(30, len(metric_data) // 5)
+                                hist_color = COLOR_PALETTE[i % len(COLOR_PALETTE)]
+                                ax_hist.hist(metric_data, bins=n_bins, density=True,
+                                             alpha=0.5, color=hist_color,
+                                             label=f"{label} Histogram")
+
+                                # Add KDE if sufficient variance and not problematic
+                                if metric not in problematic_metrics and np.ptp(metric_data) > 1e-8:
+                                    kde = gaussian_kde(metric_data)
+                                    xmin, xmax = ax_hist.get_xlim()
+                                    x = np.linspace(xmin, xmax, 300)
+                                    ax_hist.plot(x, kde(x),
+                                                 color=hist_color,
+                                                 linestyle='-',
+                                                 linewidth=1.5,
+                                                 label=f"{label} KDE")
+
+                                # Add USL/LSL lines
+                                if metric in all_stat_data[label].index:
+                                    usl = all_stat_data[label].loc[metric, 'usl']
+                                    lsl = all_stat_data[label].loc[metric, 'lsl']
+
+                                    ax_hist.axvline(usl, color=hist_color, linestyle='--',
+                                                    linewidth=1, alpha=0.7, label=f'{label} USL')
+                                    ax_hist.axvline(lsl, color=hist_color, linestyle=':',
+                                                    linewidth=1, alpha=0.7, label=f'{label} LSL')
+
+                    ax_hist.set_xlabel("Value")
+                    ax_hist.set_ylabel("Density")
+                    ax_hist.set_title("Distribution", pad=10)
+                    ax_hist.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+                    ax_hist.grid(True, linestyle='--', alpha=0.3)
+
+                    # --- STATISTICS TABLE ---
+                    ax_table.axis('off')
+                    try:
+                        table_data = [["Label", "USL", "LSL", "Mean", "Min", "Max", "Std", "CPU", "CPL", "CPK", "N"]]
+
+                        for label in labels:
+                            if metric in all_stat_data[label].index:
+                                stats_row = all_stat_data[label].loc[metric]
+                                table_data.append(
+                                    [label] + [f"{x:.2f}" if isinstance(x, (int, float)) else str(x)
+                                               for x in stats_row[["usl", "lsl", "mean", "min", "max",
+                                                                   "std", "cpu", "cpl", "cpk", "N"]]]
+                                )
+
+                        if len(table_data) > 1:
+                            table = ax_table.table(
+                                cellText=table_data,
+                                colWidths=[0.1] * len(table_data[0]),
+                                cellLoc='center',
+                                loc='center'
+                            )
+
+                            for (i, j), cell in table.get_celld().items():
+                                if i == 0:
+                                    cell.set_facecolor('#dddddd')
+                                    cell.set_text_props(weight='bold')
+                                cell.set_edgecolor('black')
+                                cell.set_linewidth(0.5)
+
+                            table.scale(1, 1.8)
+                    except Exception as e:
+                        print(f"Error creating table for {metric}: {str(e)}")
+                    pdf.savefig(fig, bbox_inches='tight')
+                    plt.close(fig)
+
+                except Exception as e:
+                    print(f"⚠ Skipping {metric}: {str(e)}")
+                    plt.close(fig)
+                    continue
+
+        print(f"✓ PDF created at: {pdf_path}")
+        return True
+
+    except Exception as e:
+        print(f"✖ PDF generation failed: {str(e)}")
+        if 'pdf_path' in locals() and os.path.exists(pdf_path):
+            os.remove(pdf_path)
+        return False
+
+
+def filter_metrics_with_limits(limits_df):
+    """filter out metrics with limits"""
+    metrics_with_limits = []
+    for column in limits_df.columns:
+        if any(is_number(limits_df[column].loc[index]) for index in limits_df.index):
+            metrics_with_limits.append(column)
+    return metrics_with_limits
+
+
+def cpk_analysis_main():
+    global check_drift
+    global drop_dup
+    global pass_only
+
+    # Initialize timing variables at the start
+    time_start = time_end = None
+
+    try:
+        # Check for input files
+        if len(text_log.toPlainText().rstrip()) == 0:
+            print("No log file specified")
+            return
+
+        # Process input files
+        temp_logs = text_log.toPlainText().rstrip().split("\n")
+        comp_logs = []
+        for log in temp_logs:
+            if len(log.rstrip()) == 0:
+                continue
+            file_pos = log.find("file://") + 7
+            if file_pos != 6:  # find returns -1 if not found, +7 makes it 6
+                clean_path = log[file_pos:].rstrip()
+                if os.path.exists(clean_path):
+                    comp_logs.append(clean_path)
+                else:
+                    print(f"Warning: File not found - {clean_path}")
+
+        if not comp_logs:
+            print("No valid log files found")
+            return
+
+        # Generate simple sequential labels (log, log1, log2, etc.)
+        labels = []
+        for i, log_file in enumerate(comp_logs):
+            if i == 0:
+                labels.append("log")  # First file is just "log"
+            else:
+                labels.append(f"log{i}")  # Subsequent files are log1, log2, etc.
+
+        # Set up paths and output directory
+        last_file_name = comp_logs[-1]
+        log_file_path = os.path.dirname(last_file_name)
+        output_folder = os.path.join(log_file_path, OutputFolderName)
+
+        # Create output directory if it doesn't exist
+        os.makedirs(output_folder, exist_ok=True)
+
+        # Verify output directory is writable
+        if not os.access(output_folder, os.W_OK):
+            print(f"Error: Cannot write to output directory {output_folder}")
+            return
+
+        # Data collection and processing
+        all_log_data = {}
+        all_limits_data = {}
+        all_stat_data = {}
+
+        print("Getting data from log ...")
+        time_start = time.time()
+
+        for i, (log_file, label) in enumerate(zip(comp_logs, labels)):
+            print(f"Processing {label}: {log_file}")
+
+            try:
+                # Get data from CSV using the generated label
+                (data_comp_temp_df, limits_df_comp_temp, metrics_with_limits_comp_temp,
+                 sn_string_comp_temp, usl_string_comp_temp, lsl_string_comp_temp) = get_smt_data_from_csv(
+                    log_file, sn_strings, usl_strings, lsl_strings, drop_dup, pass_only, label)
+
+                # Calculate CPK stats
+                (stat_comp_temp_df, stat_comp_wavied_temp_df, metrics_with_cpk_comp_temp,
+                 metrics_without_cpk_comp_temp) = calc_cpk(
+                    data_comp_temp_df, limits_df_comp_temp, metrics_with_limits_comp_temp,
+                    usl_only_strings, lsl_only_strings, cpk_waived_strings,
+                    usl_string_comp_temp, lsl_string_comp_temp, True, "cpk", 0, label)
+
+                # Store results
+                all_log_data[label] = data_comp_temp_df
+                all_limits_data[label] = limits_df_comp_temp
+                all_stat_data[label] = stat_comp_temp_df
+
+                # Save individual CSV files
+                csv_path = os.path.join(output_folder, f"cpk_{label}.csv")
+                stat_comp_temp_df.to_csv(csv_path, na_rep="")
+                print(f"Saved CSV: {csv_path}")
+
+                waived_csv_path = os.path.join(output_folder, f"cpk_waived_{label}.csv")
+                stat_comp_wavied_temp_df.to_csv(waived_csv_path, na_rep="")
+                print(f"Saved waived CSV: {waived_csv_path}")
+
+            except Exception as e:
+                print(f"Error processing file {log_file}: {str(e)}")
+                continue
+
+        time_end = time.time()
+        print(f"Data processing completed in {time_end - time_start:.2f} seconds")
+
+        # Generate PDF report
+        print("Generating PDF report...")
+        pdf_time_start = time.time()
+
+        # Generate the combined PDF report
+        plot_to_pdf(output_folder, all_log_data, all_limits_data, all_stat_data,
+                    pdf_name, labels, if_plot_all)
+
+        pdf_time_end = time.time()
+        print(f"PDF generation completed in {pdf_time_end - pdf_time_start:.2f} seconds")
+        print("Analysis completed successfully")
+
+    except Exception as e:
+        error_msg = f"Critical error in analysis: {str(e)}"
+        print(error_msg)
+        if time_start and time_end:
+            print(f"Processing time: {time_end - time_start:.2f} seconds")
+        import traceback
+        traceback.print_exc()
+
+
+class TextEditLog(QTextEdit):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.init_edit_log()
+
+    def init_edit_log(self):
+        self.resize(540, 360)
+        self.setPlaceholderText("Drag and drop csv files here.\nPlot order follows file order.")
+
+    def dropEvent(self, e):
+        self.setText(self.toPlainText() + e.mimeData().text() + "\n")
+
+
+class PassOnlyCkb(QCheckBox):
+    stateChanged = pyqtSignal(int)
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.init_status()
+
+    def init_status(self):
+        self.setText("Pass Only")
+        self.setChecked(True)
+        self.setEnabled(True)
+        self.move(120, 15)
+        self.stateChanged.connect(self.pass_only_state)
+
+    def pass_only_state(self, state):
+        global pass_only
+        pass_only = bool(state)
+
+
+class LastOnlyCkb(QCheckBox):
+    # Signal declaration
+    stateChanged = pyqtSignal(int)  # This overrides the built-in signal
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.init_status()
+
+    def init_status(self):
+        self.setText("Last Only")
+        self.setChecked(True)
+        self.move(30, 15)
+
+        # Connect the signal to the slot
+        self.stateChanged.connect(self.last_only_state)  # Note: self.stateChanged
+
+    def last_only_state(self, state):
+        global drop_dup
+        drop_dup = "last" if state else False
+
+
+class CheckDriftCkb(QCheckBox):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.init_status()
+
+    def init_status(self):
+        self.setText("Drift by SN")
+        self.setEnabled(False)
+        self.move(210, 15)
+        self.stateChanged.connect(self.check_drift_state)
+
+    def check_drift_state(self):
+        global check_drift
+        check_drift = self.isChecked()
+
+
+class PlotAllCkb(QCheckBox):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.init_status()
+
+    def init_status(self):
+        self.setText("Plot All")
+        self.setChecked(False)
+        self.setEnabled(True)
+        self.move(300, 15)
+        self.stateChanged.connect(self.check_drift_state)
+
+    def check_drift_state(self):
+        global if_plot_all
+        if_plot_all = self.isChecked()
+
+
+if __name__ == "__main__":
+    cpk_app = QApplication(sys.argv)
+    load_config("./config.conf")
+    cpk_root = QWidget()
+    cpk_root.setWindowTitle("CPK Analysis")
+    cpk_root.resize(600, 480)
+    cpk_root.move(60, 15)
+
+    ckbox_last_only = LastOnlyCkb(cpk_root)
+    ckbox_pass_only = PassOnlyCkb(cpk_root)
+    check_drift_ckb = CheckDriftCkb(cpk_root)
+    plot_all = PlotAllCkb(cpk_root)
+
+    text_log = TextEditLog(cpk_root)
+    text_log.move(30, 40)
+
+    button_start = QPushButton("Start", parent=cpk_root)
+    button_start.resize(200, 60)
+    button_start.clicked.connect(cpk_analysis_main)
+    button_start.move(200, 410)
+
+    cpk_root.show()
+    cpk_app.exec_()

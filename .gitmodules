@@ -1,0 +1,3 @@
+[submodule "cpk_analysis"]
+	path = cpk_analysis
+	url = git@github.com:Tangled2024/cpk-analysis-tool.git
