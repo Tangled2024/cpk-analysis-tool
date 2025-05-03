@@ -1,21 +1,44 @@
-<<<<<<< HEAD
-# CascadeProjects
+# cpk-analysis-tool
 
-Project repository for CPK analysis and related work.
+![Python](https://img.shields.io/badge/python-3.9+-blue.svg)
+![License](https://img.shields.io/badge/license-MIT-green.svg)
 
-## Getting Started
+## About
+Industrial-grade process capability analysis tool for manufacturing quality control
 
-1. Clone this repository
-2. Set up a virtual environment:
-   ```
-   python -m venv .venv
-   source .venv/bin/activate  # On Windows use `.venv\Scripts\activate`
-   pip install -r requirements.txt
-   ```
-3. Run the analysis:
-   ```
-   python test_cpk_python
-   ```
+## Key Features
+
+### Statistical Analysis
+- CPK/PPK calculations
+- Process capability indices
+- Confidence interval estimation
+
+### Advanced Capabilities
+- ML-powered anomaly detection
+- Automated PDF reporting
+- Interactive data visualization
+
+### Industry Support
+- Automotive standards (IATF 16949)
+- Electronics manufacturing
+- General industrial applications
+
+## Tech Stack
+Python 3.9+
+├── PyQt6 (GUI)
+├── Pandas (Data processing)
+├── Matplotlib/Seaborn (Visualization)
+└── Scikit-learn (ML components)
+
+## Installation
+```bash
+git clone https://github.com/Tangled2024/cpk-analysis-tool.git
+cd cpk-analysis-tool
+python -m venv .venv
+source .venv/bin/activate  # Linux/Mac
+.venv\Scripts\activate  # Windows
+pip install -r requirements.txt
+```
 
 ## Project Structure
 
@@ -23,9 +46,4 @@ Project repository for CPK analysis and related work.
 - `test_cpk_python`: Test script
 
 ## License
-
 MIT
-=======
-# cpk-analysis-tool
-CPK Analysis Suite Industrial-grade process capability analysis tool for manufacturing quality control  Key Features:  📊 Calculates CPK, PPK and other statistical metrics 🔍 ML-powered anomaly detection 📈 Automated PDF reporting 🏭 Supports automotive/electronics manufacturing standards 🐍 Python-based with PyQt GUI
->>>>>>> 27b9913bf37c4e26c16ceb9ba2b56c34bad2c003
