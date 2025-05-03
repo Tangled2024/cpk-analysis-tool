@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # CascadeProjects
 
 Project repository for CPK analysis and related work.
@@ -24,3 +25,7 @@ Project repository for CPK analysis and related work.
 ## License
 
 MIT
+=======
+# cpk-analysis-tool
+CPK Analysis Suite Industrial-grade process capability analysis tool for manufacturing quality control  Key Features:  📊 Calculates CPK, PPK and other statistical metrics 🔍 ML-powered anomaly detection 📈 Automated PDF reporting 🏭 Supports automotive/electronics manufacturing standards 🐍 Python-based with PyQt GUI
+>>>>>>> 27b9913bf37c4e26c16ceb9ba2b56c34bad2c003
